@@ -1,18 +1,9 @@
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-
-# Python
+*.xlsx
+*.zip
+*.pdf
+*.png
+figures_final/
+figures/
 __pycache__/
-*.py[cod]
-*.so
-.Python
-*.egg-info/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Temp files
-~$*
+*.pyc
+.DS_Store
