@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+GSEA Multi-Stage Pipeline: Liver DLY vs TFB (15/45/75/105 kg)
+===============================================================
+Combined approach to overcome n=6/group power limitation:
+
+  A. Multi-stage linear model (expr ~ breed + stage)
+     → breed main effect as preranked metric
+     → n=48 vs n=12 at 45kg alone → dramatic power gain
+
+  B. ssGSEA pathway scoring per sample
+     → aggregate gene-level signal into pathway scores
+     → compare DLY vs TFB at 45kg on pathway scores
+
+Output:
+  - gsea_multistage_deg_results.xlsx       (breed effect + 45kg effect)
+  - gsea_multistage_enrichment.xlsx        (GSEA preranked results)
+  - gsea_multistage_ssgsea_scores.xlsx     (per-sample pathway scores)
+  - gsea_multistage_ssgsea_45kg_test.xlsx  (45kg pathway comparison)
+  - fig_MS1_volcano_breed.pdf
+  - fig_MS2_gsea_enrichment_bar.pdf
+  - fig_MS3_ssgsea_heatmap_45kg.pdf
+  - fig_MS4_aa_pathway_scores.pdf
+"""
+import pandas as pd
+import numpy as np
+from scipy.stats import t as t_dist, ttest_ind
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+import gseapy as gp
+import warnings
+import os
+warnings.filterwarnings('ignore')
+
+from stats_utils import benjamini_hochberg, safe_ttest
+
+# ============================================================
+# Style
+# ============================================================
+plt.rcParams.update({
+    'font.family': 'sans-serif', 'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+    'font.size': 8, 'axes.titlesize': 11, 'axes.labelsize': 9,
+    'xtick.labelsize': 7, 'ytick.labelsize': 7, 'legend.fontsize': 7,
+    'figure.dpi': 150, 'savefig.dpi': 300, 'savefig.bbox': 'tight',
+    'axes.linewidth': 0.8,
+})
+
+C_DLY = '#2166AC'
+C_TFB = '#B2182B'
+C_NS  = '#999999'
+
+os.makedirs('figures_final', exist_ok=True)
+
+# ============================================================
+# 1. Load liver data (all stages)
+# ============================================================
+print("=" * 70)
+print("GSEA MULTI-STAGE: Liver DLY vs TFB @ 15/45/75/105 kg")
+print("=" * 70)
+
+print("\n[1/8] Loading liver expression data...")
+liver = pd.read_csv('gene_expression/liver_gene_matrix.xls', sep='\t')
+
+# Map samples to breed/stage
+sample_cols_all = [c for c in liver.columns if c not in ('seq_id', 'gene_name', 'length', 'description')]
+
+sample_meta = {}
+for c in sample_cols_all:
+    parts = c.split('_')
+    if parts[0] != 'L':
+        continue
+    stage_code = parts[1]
+    breed_code = parts[2]
+    stage_map = {'15': 15, '45': 45, '1': 75, '2': 105, '3': 135}
+    if stage_code not in stage_map:
+        continue
+    breed = 'DLY' if breed_code == '1' else 'TFB'
+    sample_meta[c] = {'breed': breed, 'stage': stage_map[stage_code]}
+
+# Only keep stages with both breeds (15/45/75/105)
+balanced_samples = {c: m for c, m in sample_meta.items() if m['stage'] != 135}
+print(f"  Balanced-design samples (15/45/75/105): {len(balanced_samples)}")
+
+# Count
+from collections import Counter
+bc = Counter((m['breed'], m['stage']) for m in balanced_samples.values())
+for (breed, stage), n in sorted(bc.items()):
+    print(f"    {breed} {stage}kg: n={n}")
+
+# Expression matrix for balanced samples
+sample_ids = sorted(balanced_samples.keys())
+n_samples = len(sample_ids)
+
+# Build metadata arrays
+breeds = np.array([balanced_samples[s]['breed'] for s in sample_ids])
+stages = np.array([balanced_samples[s]['stage'] for s in sample_ids])
+
+# Build expression matrix (genes × samples)
+gene_ids = liver['seq_id'].values
+gene_names_raw = liver['gene_name'].fillna('').values
+
+expr_mat = np.zeros((len(gene_ids), n_samples))
+for j, s in enumerate(sample_ids):
+    expr_mat[:, j] = pd.to_numeric(liver[s], errors='coerce').fillna(0).values
+
+# Filter to expressed genes (mean > 0.1 across samples)
+gene_means_raw = expr_mat.mean(axis=1)
+expressed = gene_means_raw > 0.1
+print(f"  Expressed genes: {expressed.sum():,} / {len(gene_ids):,}")
+
+expr_mat = expr_mat[expressed, :]
+gene_ids = gene_ids[expressed]
+gene_names_raw = gene_names_raw[expressed]
+gene_means = gene_means_raw[expressed]
+n_genes = len(gene_ids)
+
+log2_expr = np.log2(expr_mat + 0.01)
+
+# ============================================================
+# 2. Per-gene linear model: expr ~ breed + C(stage)
+# ============================================================
+print(f"\n[2/8] Per-gene linear model: log2(expr) ~ breed + stage...")
+
+# Design matrix: intercept + breed_TFB + stage_45 + stage_75 + stage_105
+X = np.zeros((n_samples, 5))
+X[:, 0] = 1.0                              # intercept (DLY @ 15kg ref)
+X[:, 1] = (breeds == 'TFB').astype(float)   # breed effect (TFB vs DLY)
+X[:, 2] = (stages == 45).astype(float)      # stage 45 vs 15
+X[:, 3] = (stages == 75).astype(float)      # stage 75 vs 15
+X[:, 4] = (stages == 105).astype(float)     # stage 105 vs 15
+
+# Precompute (X'X)^-1 X' for vectorized OLS
+XtX = X.T @ X
+XtX_inv = np.linalg.inv(XtX)
+H = XtX_inv @ X.T   # hat matrix: (5 × n_samples)
+
+n_params = X.shape[1]
+dof = n_samples - n_params
+se_factor = np.sqrt(np.diag(XtX_inv))  # sqrt of diagonal of (X'X)^-1
+
+# Process in batches to manage memory
+batch_size = 5000
+n_batches = int(np.ceil(n_genes / batch_size))
+
+breed_coef = np.zeros(n_genes)
+breed_se = np.zeros(n_genes)
+breed_t = np.zeros(n_genes)
+breed_p = np.zeros(n_genes)
+breed_log2fc = np.zeros(n_genes)  # DLY - TFB in log2 space at 45kg specifically
+
+for b in range(n_batches):
+    start = b * batch_size
+    end = min(start + batch_size, n_genes)
+    Y = log2_expr[start:end, :].T  # (n_samples × batch)
+
+    # OLS: B = (X'X)^-1 X' Y → (5 × batch)
+    B = H @ Y
+
+    # Residuals and SE
+    Y_hat = X @ B
+    residuals = Y - Y_hat
+    rss = np.sum(residuals**2, axis=0)
+    sigma2 = rss / dof
+    sigma2[sigma2 <= 0] = 1e-12
+
+    # SE for breed coefficient (index 1)
+    se = np.sqrt(sigma2) * se_factor[1]
+    t_stat = B[1, :] / se
+    p_vals = 2 * t_dist.sf(np.abs(t_stat), dof)
+
+    breed_coef[start:end] = B[1, :]
+    breed_se[start:end] = se
+    breed_t[start:end] = t_stat
+    breed_p[start:end] = p_vals
+
+    if (b + 1) % 3 == 0:
+        print(f"  Progress: {end:,}/{n_genes:,} genes")
+
+# FDR correction
+rejected, qvalues = benjamini_hochberg(breed_p)
+
+# breed_coef is TFB - DLY in log2 space (positive = TFB higher)
+# For consistency with previous analysis, define log2FC as DLY - TFB
+log2fc_breed = -breed_coef   # DLY vs TFB breed effect
+
+n_nom = (breed_p < 0.05).sum()
+n_fdr = rejected.sum()
+print(f"\n  Nominal P<0.05 (breed): {n_nom:,} / {n_genes:,} ({100*n_nom/n_genes:.1f}%)")
+print(f"  FDR < 0.05 (breed):    {n_fdr:,} / {n_genes:,} ({100*n_fdr/n_genes:.1f}%)")
+
+# ============================================================
+# 2b. 45kg-specific effect for comparison
+# ============================================================
+print("\n  Computing 45kg-specific breed effects...")
+
+is_45 = stages == 45
+n_45 = is_45.sum()
+dly_45 = (breeds == 'DLY') & is_45
+tfb_45 = (breeds == 'TFB') & is_45
+
+log2fc_45 = np.zeros(n_genes)
+p_45 = np.ones(n_genes)
+for g in range(n_genes):
+    dly_vals = log2_expr[g, dly_45]
+    tfb_vals = log2_expr[g, tfb_45]
+    log2fc_45[g] = dly_vals.mean() - tfb_vals.mean()
+    t_stat, p_val = safe_ttest(dly_vals, tfb_vals)
+    if not np.isnan(p_val):
+        p_45[g] = p_val
+
+# ============================================================
+# 3. Build results table
+# ============================================================
+print("\n[3/8] Building DEG results table...")
+
+# Clean gene names
+names_clean = []
+seen = set()
+for gid, gname in zip(gene_ids, gene_names_raw):
+    name = str(gname).strip() if gname and str(gname).strip() != '' else str(gid).strip()
+    if name in seen:
+        name = f"{name}_{gid[:8]}"
+    seen.add(name)
+    names_clean.append(name)
+
+deg_df = pd.DataFrame({
+    'gene_id': gene_ids,
+    'gene_name': names_clean,
+    'breed_coef_TFBvsDLY': breed_coef,          # raw coefficient
+    'breed_log2FC_DLYvsTFB': log2fc_breed,       # DLY - TFB
+    'breed_SE': breed_se,
+    'breed_t_stat': breed_t,
+    'breed_pvalue': breed_p,
+    'breed_qvalue': qvalues,
+    'breed_FDR_significant': rejected,
+    'log2FC_45kg_DLYvsTFB': log2fc_45,
+    'pvalue_45kg': p_45,
+    'mean_log2_expr': log2_expr.mean(axis=1),
+})
+
+deg_df['abs_breed_log2FC'] = deg_df['breed_log2FC_DLYvsTFB'].abs()
+
+# Report
+n_strong = (deg_df['breed_FDR_significant'] & (deg_df['abs_breed_log2FC'] > 0.5)).sum()
+print(f"  Total expressed genes: {n_genes:,}")
+print(f"  FDR<0.05 + |log2FC|>0.5: {n_strong:,}")
+
+# ============================================================
+# 4. Preranked GSEA
+# ============================================================
+print("\n[4/8] Building preranked gene list for GSEA (breed main effect)...")
+
+rank_df = deg_df.copy()
+# Ranking metric: sign(log2FC) * (|log2FC| - log10(p))
+rank_df['rank_metric'] = np.sign(rank_df['breed_log2FC_DLYvsTFB']) * (
+    rank_df['abs_breed_log2FC'] - np.log10(rank_df['breed_pvalue'].clip(lower=1e-300))
+)
+rank_df = rank_df.sort_values('breed_pvalue').drop_duplicates(subset='gene_name', keep='first')
+rank_df = rank_df.sort_values('rank_metric', ascending=False)
+
+rnk = rank_df[['gene_name', 'rank_metric']].dropna()
+rnk = rnk[rnk['gene_name'].str.strip() != '']
+print(f"  Ranked genes: {len(rnk):,}")
+
+# ============================================================
+# 5. Run GSEA preranked
+# ============================================================
+print("\n[5/8] Running GSEA preranked (breed effect ranking)...")
+
+LIBRARIES = {
+    'Hallmark_2020': 'MSigDB_Hallmark_2020',
+    'KEGG_2021': 'KEGG_2021_Human',
+    'Reactome_2024': 'Reactome_Pathways_2024',
+    'WikiPathways_2024': 'WikiPathways_2024_Human',
+    'GO_BP_2025': 'GO_Biological_Process_2025',
+}
+
+gsea_results = {}
+for lib_name, lib_id in LIBRARIES.items():
+    try:
+        print(f"  {lib_name}...", end=' ')
+        gs_res = gp.prerank(
+            rnk=rnk, gene_sets=lib_id, organism='human',
+            outdir=None, min_size=10, max_size=500,
+            permutation_num=1000, seed=42, threads=2, verbose=False,
+        )
+        res_df = gs_res.res2d
+        if res_df is not None and len(res_df) > 0:
+            res_df['Library'] = lib_name
+            res_df['NES'] = pd.to_numeric(res_df['NES'], errors='coerce')
+            res_df['FDR q-val'] = pd.to_numeric(res_df['FDR q-val'], errors='coerce')
+            gsea_results[lib_name] = res_df
+            n_sig = (res_df['FDR q-val'] < 0.05).sum()
+            n_sig25 = (res_df['FDR q-val'] < 0.25).sum()
+            print(f"{len(res_df)} sets, {n_sig} FDR<0.05, {n_sig25} FDR<0.25")
+        else:
+            print("empty")
+    except Exception as e:
+        print(f"failed: {e}")
+
+# ============================================================
+# 6. ssGSEA: per-sample pathway scoring
+# ============================================================
+print("\n[6/8] Running ssGSEA for per-sample pathway scoring...")
+
+# Build expression matrix indexed by gene symbols (for gseapy gene set matching)
+ssgsea_expr = pd.DataFrame(log2_expr, index=names_clean, columns=sample_ids)
+ssgsea_expr.index = ssgsea_expr.index.str.strip()
+ssgsea_expr = ssgsea_expr[~ssgsea_expr.index.duplicated(keep='first')]
+print(f"  ssGSEA input: {ssgsea_expr.shape[0]} genes × {ssgsea_expr.shape[1]} samples")
+
+ssgsea_results = {}
+for lib_name, lib_id in LIBRARIES.items():
+    try:
+        print(f"  {lib_name}...", end=' ')
+        ss_res = gp.ssgsea(
+            data=ssgsea_expr, gene_sets=lib_id, organism='human',
+            outdir=None, min_size=10, max_size=500,
+            sample_norm_method='rank', no_plot=True,
+            processes=1, seed=42, format='pandas',
+        )
+        # ss_res.res2d is long-form: Name(sample) | Term(pathway) | ES | NES
+        # Pivot to pathway × sample matrix
+        long_df = ss_res.res2d
+        if long_df is not None and len(long_df) > 0:
+            scores_df = long_df.pivot(index='Term', columns='Name', values='NES')
+            ssgsea_results[lib_name] = scores_df
+            print(f"{scores_df.shape[0]} pathways × {scores_df.shape[1]} samples")
+        else:
+            print("empty")
+    except Exception as e:
+        print(f"failed: {e}")
+
+# ============================================================
+# 7. 45kg pathway comparison from ssGSEA scores
+# ============================================================
+print("\n[7/8] Testing ssGSEA pathway scores: DLY vs TFB @ 45kg...")
+
+dly_45_cols = [s for s in sample_ids if balanced_samples[s]['breed'] == 'DLY' and balanced_samples[s]['stage'] == 45]
+tfb_45_cols = [s for s in sample_ids if balanced_samples[s]['breed'] == 'TFB' and balanced_samples[s]['stage'] == 45]
+
+print(f"  DLY 45kg: {len(dly_45_cols)} samples, TFB 45kg: {len(tfb_45_cols)} samples")
+
+pathway_tests = []
+for lib_name, scores_df in ssgsea_results.items():
+    dly_cols_in = [c for c in dly_45_cols if c in scores_df.columns]
+    tfb_cols_in = [c for c in tfb_45_cols if c in scores_df.columns]
+    if len(dly_cols_in) < 2 or len(tfb_cols_in) < 2:
+        continue
+    for pathway in scores_df.index:
+        dly_scores = scores_df.loc[pathway, dly_cols_in].astype(float).values
+        tfb_scores = scores_df.loc[pathway, tfb_cols_in].astype(float).values
+
+        # Drop NaN
+        dly_scores = dly_scores[~np.isnan(dly_scores)]
+        tfb_scores = tfb_scores[~np.isnan(tfb_scores)]
+
+        if len(dly_scores) >= 2 and len(tfb_scores) >= 2:
+            t_stat, p_val = ttest_ind(dly_scores, tfb_scores, equal_var=False)
+            cohens_d = (dly_scores.mean() - tfb_scores.mean()) / max(
+                np.sqrt((dly_scores.var(ddof=1) + tfb_scores.var(ddof=1)) / 2), 1e-12
+            )
+            pathway_tests.append({
+                'Library': lib_name,
+                'Pathway': pathway,
+                'DLY_mean_ssGSEA': dly_scores.mean(),
+                'TFB_mean_ssGSEA': tfb_scores.mean(),
+                'delta_ssGSEA': dly_scores.mean() - tfb_scores.mean(),
+                'Cohens_d': cohens_d,
+                't_statistic': t_stat,
+                'P_value': p_val,
+            })
+
+pathway_df = pd.DataFrame(pathway_tests)
+if len(pathway_df) > 0:
+    _, pq = benjamini_hochberg(pathway_df['P_value'].values)
+    pathway_df['Q_value'] = pq
+    pathway_df['FDR_significant'] = pq < 0.05
+    pathway_df = pathway_df.sort_values('P_value')
+
+    n_sig_path = pathway_df['FDR_significant'].sum()
+    n_nom_path = (pathway_df['P_value'] < 0.05).sum()
+    print(f"  Total pathways tested: {len(pathway_df)}")
+    print(f"  Nominal P<0.05: {n_nom_path} → FDR<0.05: {n_sig_path}")
+
+    if n_sig_path > 0:
+        print(f"\n  Top FDR-significant pathways:")
+        for _, r in pathway_df[pathway_df['FDR_significant']].head(15).iterrows():
+            direction = 'DLY-up' if r['delta_ssGSEA'] > 0 else 'TFB-up'
+            print(f"    [{r['Library']}] {r['Pathway'][:60]}: d={r['Cohens_d']:+.2f}, P={r['P_value']:.4f}, Q={r['Q_value']:.4f} [{direction}]")
+
+# ============================================================
+# 8. Save results
+# ============================================================
+print("\n[8/8] Saving results...")
+
+deg_df.to_excel('gsea_multistage_deg_results.xlsx', index=False)
+print("  Saved gsea_multistage_deg_results.xlsx")
+
+if gsea_results:
+    with pd.ExcelWriter('gsea_multistage_enrichment.xlsx') as writer:
+        for lib_name, res_df in gsea_results.items():
+            cols = ['Term', 'ES', 'NES', 'NOM p-val', 'FDR q-val', 'Library']
+            avail = [c for c in cols if c in res_df.columns]
+            res_df[avail].sort_values('FDR q-val').to_excel(writer, sheet_name=lib_name[:31], index=False)
+    print("  Saved gsea_multistage_enrichment.xlsx")
+
+combined_scores = []
+for lib_name, scores_df in ssgsea_results.items():
+    scores_df_copy = scores_df.copy()
+    scores_df_copy['Library'] = lib_name
+    combined_scores.append(scores_df_copy)
+if combined_scores:
+    all_scores = pd.concat(combined_scores)
+    all_scores.to_excel('gsea_multistage_ssgsea_scores.xlsx')
+    print("  Saved gsea_multistage_ssgsea_scores.xlsx")
+
+pathway_df.to_excel('gsea_multistage_ssgsea_45kg_test.xlsx', index=False)
+print("  Saved gsea_multistage_ssgsea_45kg_test.xlsx")
+
+# ============================================================
+# FIGURE MS1: Volcano Plot (breed main effect)
+# ============================================================
+print("\nGenerating Figure MS1: Volcano plot (breed main effect)...")
+
+fig, ax = plt.subplots(figsize=(6, 5.5))
+
+# Categories
+not_sig = ~deg_df['breed_FDR_significant'] | (deg_df['abs_breed_log2FC'] < 0.3)
+fdr_up = deg_df['breed_FDR_significant'] & (deg_df['breed_log2FC_DLYvsTFB'] > 0.3)
+fdr_dn = deg_df['breed_FDR_significant'] & (deg_df['breed_log2FC_DLYvsTFB'] < -0.3)
+
+ax.scatter(deg_df.loc[not_sig, 'breed_log2FC_DLYvsTFB'],
+           -np.log10(deg_df.loc[not_sig, 'breed_pvalue'].clip(lower=1e-300)),
+           c=C_NS, s=1, alpha=0.25, rasterized=True)
+
+ax.scatter(deg_df.loc[fdr_up, 'breed_log2FC_DLYvsTFB'],
+           -np.log10(deg_df.loc[fdr_up, 'breed_pvalue'].clip(lower=1e-300)),
+           c=C_DLY, s=5, alpha=0.6, rasterized=True, label=f'DLY-up FDR<0.05 ({fdr_up.sum():,})')
+
+ax.scatter(deg_df.loc[fdr_dn, 'breed_log2FC_DLYvsTFB'],
+           -np.log10(deg_df.loc[fdr_dn, 'breed_pvalue'].clip(lower=1e-300)),
+           c=C_TFB, s=5, alpha=0.6, rasterized=True, label=f'TFB-up FDR<0.05 ({fdr_dn.sum():,})')
+
+# Label top 20 genes
+top_genes = deg_df.nlargest(20, 'abs_breed_log2FC')
+for _, g in top_genes.iterrows():
+    ax.annotate(g['gene_name'],
+                (g['breed_log2FC_DLYvsTFB'], -np.log10(max(g['breed_pvalue'], 1e-300))),
+                fontsize=5, fontweight='bold', ha='center', va='bottom',
+                xytext=(0, 3), textcoords='offset points')
+
+# Highlight AA catabolism genes
+AA_GENES = ['BCAT2', 'BCKDHA', 'BCKDHB', 'DBT', 'DLD', 'CPS1', 'OTC',
+            'ASS1', 'ASL', 'ARG1', 'GOT1', 'GOT2', 'GPT', 'AASS', 'HGD',
+            'ACADSB', 'GLUD1', 'SDS', 'HAL', 'PAH', 'STAT3']
+for gname in AA_GENES:
+    match = deg_df[deg_df['gene_name'].str.upper() == gname.upper()]
+    if len(match) > 0:
+        g = match.iloc[0]
+        ax.annotate(g['gene_name'],
+                    (g['breed_log2FC_DLYvsTFB'], -np.log10(max(g['breed_pvalue'], 1e-300))),
+                    fontsize=5.5, fontweight='bold', color='#D73027',
+                    ha='center', va='bottom', xytext=(0, 5), textcoords='offset points')
+
+ax.axhline(-np.log10(0.05), color='gray', ls='--', lw=0.5, alpha=0.5)
+ax.axvline(0, color='gray', ls='-', lw=0.3, alpha=0.3)
+
+ax.set_xlabel('log2(DLY / TFB) breed effect (stage-adjusted)', fontsize=10)
+ax.set_ylabel('-log10(P value)', fontsize=10)
+ax.set_title('Liver DLY vs TFB: Stage-Adjusted Breed Effect\nLinear Model: expr ~ breed + stage (15/45/75/105 kg)',
+             fontsize=11, fontweight='bold')
+ax.legend(loc='upper left', frameon=True, fontsize=6.5, markerscale=2)
+
+ax.text(0.98, 0.98, f'n={n_genes:,} genes; n=48 samples\n'
+        f'Nominal P<0.05: {n_nom:,} | FDR<0.05: {n_fdr:,}',
+        transform=ax.transAxes, va='top', ha='right', fontsize=6.5, color='#555555')
+
+plt.tight_layout()
+fig.savefig('figures_final/fig_MS1_volcano_breed.pdf', dpi=300)
+fig.savefig('figures_final/fig_MS1_volcano_breed.png', dpi=300)
+plt.close()
+print("  Saved fig_MS1_volcano_breed.pdf/png")
+
+# ============================================================
+# FIGURE MS2: GSEA Enrichment Bar Plot
+# ============================================================
+print("Generating Figure MS2: GSEA enrichment summary...")
+
+all_paths = []
+for lib, res in gsea_results.items():
+    if res is None or len(res) == 0:
+        continue
+    sig = res[res['FDR q-val'] < 0.25].copy()
+    sig['Library'] = lib
+    sig['abs_NES'] = sig['NES'].abs()
+    all_paths.append(sig)
+
+if all_paths:
+    combined = pd.concat(all_paths, ignore_index=True)
+    combined['direction'] = combined['NES'].apply(lambda x: 'TFB-enriched' if x < 0 else 'DLY-enriched')
+    top_paths = combined.nlargest(35, 'abs_NES')
+
+    fig, ax = plt.subplots(figsize=(10, 9))
+    y_positions = list(range(len(top_paths)))
+
+    for i, (idx, row) in enumerate(top_paths.iterrows()):
+        color = C_TFB if row['direction'] == 'TFB-enriched' else C_DLY
+        nes_val = float(row['NES'])
+        ax.barh(i, abs(nes_val), color=color, alpha=0.85, height=0.7,
+                edgecolor='white', linewidth=0.3)
+        fdr_val = float(row['FDR q-val'])
+        fdr_str = f"FDR={fdr_val:.2e}" if fdr_val < 0.01 else f"FDR={fdr_val:.3f}"
+        sig_mark = '***' if fdr_val < 0.05 else ('**' if fdr_val < 0.10 else '*')
+        ax.text(abs(nes_val) + 0.05, i, f"{fdr_str} {sig_mark}", va='center', fontsize=5, color='#555555')
+        label = f"{str(row['Term'])[:70]} [{row['Library']}]"
+        ax.text(0.05, i, label, va='center', fontsize=5.5, color='#222222')
+
+    ax.set_yticks([])
+    ax.set_xlabel('|Normalized Enrichment Score|', fontsize=10)
+    ax.set_title('GSEA Preranked: Multi-Stage Breed Effect\nDLY vs TFB Liver (15/45/75/105 kg)',
+                 fontsize=12, fontweight='bold')
+    ax.invert_yaxis()
+
+    legend_elements = [
+        mpatches.Patch(facecolor=C_TFB, alpha=0.85, label='TFB-enriched'),
+        mpatches.Patch(facecolor=C_DLY, alpha=0.85, label='DLY-enriched'),
+    ]
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=7, frameon=True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    fig.savefig('figures_final/fig_MS2_gsea_enrichment_bar.pdf', dpi=300)
+    fig.savefig('figures_final/fig_MS2_gsea_enrichment_bar.png', dpi=300)
+    plt.close()
+    print("  Saved fig_MS2_gsea_enrichment_bar.pdf/png")
+
+# ============================================================
+# FIGURE MS3: ssGSEA Heatmap — Top Pathways @ 45kg
+# ============================================================
+print("Generating Figure MS3: ssGSEA pathway heatmap @ 45kg...")
+
+if len(pathway_df) > 0:
+    # Top 40 pathways by significance
+    top_paths = pathway_df.nsmallest(40, 'P_value')
+    top_names = top_paths['Pathway'].tolist()
+
+    # Build heatmap matrix: pathways × 45kg samples
+    hm_data = []
+    for lib_name, scores_df in ssgsea_results.items():
+        dly_cols_in = [c for c in dly_45_cols if c in scores_df.columns]
+        tfb_cols_in = [c for c in tfb_45_cols if c in scores_df.columns]
+        for pw in top_names:
+            if pw in scores_df.index:
+                cols_45 = dly_cols_in + tfb_cols_in
+                row_scores = scores_df.loc[pw, cols_45]
+                hm_data.append(pd.Series(row_scores.values, index=cols_45, name=f"{pw} [{lib_name}]"))
+
+    if hm_data:
+        hm_matrix = pd.DataFrame(hm_data)
+        # Z-score across samples for display
+        hm_z = hm_matrix.subtract(hm_matrix.mean(axis=1), axis=0).divide(
+            hm_matrix.std(axis=1).replace(0, 1), axis=0)
+
+        fig, ax = plt.subplots(figsize=(10, max(6, len(hm_matrix) * 0.3)))
+        cmap = sns.diverging_palette(240, 10, as_cmap=True)
+
+        # Column colors
+        col_colors = [C_DLY if 'L_45_1_' in c else C_TFB for c in hm_z.columns]
+
+        sns.heatmap(hm_z, cmap=cmap, center=0, vmin=-2, vmax=2, ax=ax,
+                    linewidths=0.3, linecolor='white',
+                    cbar_kws={'label': 'ssGSEA score (Z-scored)', 'shrink': 0.8},
+                    xticklabels=False, annot=False)
+
+        ax.set_title('ssGSEA Pathway Scores: DLY vs TFB @ 45kg\nTop Differentiated Pathways',
+                     fontsize=12, fontweight='bold')
+        ax.set_ylabel('')
+        ax.set_xlabel(f'DLY 45kg (n={len(dly_45_cols)})          TFB 45kg (n={len(tfb_45_cols)})', fontsize=8)
+
+        # Add breed label
+        mid = len(dly_45_cols)
+        ax.axvline(mid, color='black', lw=1.5)
+
+        plt.tight_layout()
+        fig.savefig('figures_final/fig_MS3_ssgsea_heatmap_45kg.pdf', dpi=300)
+        fig.savefig('figures_final/fig_MS3_ssgsea_heatmap_45kg.png', dpi=300)
+        plt.close()
+        print("  Saved fig_MS3_ssgsea_heatmap_45kg.pdf/png")
+
+# ============================================================
+# FIGURE MS4: AA Metabolism Pathway Scores @ 45kg
+# ============================================================
+print("Generating Figure MS4: AA metabolism pathway scores comparison...")
+
+# Find AA-relevant pathways from ssGSEA
+aa_keywords = ['AMINO ACID', 'UREA', 'ARGININE', 'PROLINE', 'GLUTAMINE', 'GLUTAMATE',
+               'SERINE', 'GLYCINE', 'CYSTEINE', 'METHIONINE', 'TRYPTOPHAN', 'LYSINE',
+               'BRANCHED CHAIN', 'VALINE', 'LEUCINE', 'ISOLEUCINE', 'HISTIDINE',
+               'PHENYLALANINE', 'TYROSINE', 'PROTEIN', 'MTOR', 'AUTOPHAGY',
+               'PROTEASOME', 'UBIQUITIN', 'RIBOSOME']
+
+aa_hits = pathway_df[pathway_df['Pathway'].str.upper().str.contains(
+    '|'.join(aa_keywords), na=False)].copy()
+
+if len(aa_hits) == 0:
+    # Fallback: top pathways by effect size
+    aa_hits = pathway_df.nlargest(25, 'delta_ssGSEA').copy()
+    print(f"  No AA-specific hits found; using top 25 by effect size")
+
+aa_hits = aa_hits.nlargest(20, 'Cohens_d')
+
+if len(aa_hits) > 0:
+    fig, ax = plt.subplots(figsize=(9, max(4, len(aa_hits) * 0.35)))
+
+    for i, (_, row) in enumerate(aa_hits.iterrows()):
+        d = row['Cohens_d']
+        color = C_DLY if d > 0 else C_TFB
+        ax.barh(i, abs(d), color=color, alpha=0.8, height=0.7,
+                edgecolor='white', linewidth=0.3)
+        p_str = f"P={row['P_value']:.3f}" + (f" Q={row['Q_value']:.3f}" if 'Q_value' in row else "")
+        ax.text(abs(d) + 0.02, i, p_str, va='center', fontsize=5.5, color='#555555')
+        label = f"{row['Pathway'][:65]} [{row['Library']}]"
+        ax.text(0.02, i, label, va='center', fontsize=6, color='#222222')
+
+    ax.set_yticks([])
+    ax.set_xlabel("Cohen's d (DLY − TFB)", fontsize=10)
+    ax.set_title('ssGSEA: AA/Nitrogen Metabolism Pathway Scores\nDLY vs TFB Liver @ 45 kg',
+                 fontsize=12, fontweight='bold')
+    ax.invert_yaxis()
+
+    legend_elements = [
+        mpatches.Patch(facecolor=C_DLY, alpha=0.8, label='DLY > TFB'),
+        mpatches.Patch(facecolor=C_TFB, alpha=0.8, label='TFB > DLY'),
+    ]
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=7, frameon=True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    fig.savefig('figures_final/fig_MS4_aa_pathway_scores.pdf', dpi=300)
+    fig.savefig('figures_final/fig_MS4_aa_pathway_scores.png', dpi=300)
+    plt.close()
+    print("  Saved fig_MS4_aa_pathway_scores.pdf/png")
+
+# ============================================================
+# Summary
+# ============================================================
+print("\n" + "=" * 70)
+print("MULTI-STAGE GSEA PIPELINE COMPLETE")
+print("=" * 70)
+
+print(f"""
+Pipeline comparison: Single-stage (45kg only) vs Multi-stage (15/45/75/105kg)
+{'─' * 72}
+                      45kg-only          Multi-stage
+Sample size            n=12               n=48
+Design                 Welch's t-test     expr ~ breed + stage
+DEG: Nominal P<0.05    1,025               {n_nom:,}
+DEG: FDR<0.05          0                   {n_fdr:,}
+GSEA FDR<0.05 paths    0                   {sum((res['FDR q-val'] < 0.05).sum() for res in gsea_results.values() if res is not None)}
+ssGSEA FDR<0.05 paths  —                   {pathway_df['FDR_significant'].sum() if len(pathway_df) > 0 else 0}
+
+Output files:
+  gsea_multistage_deg_results.xlsx         — {n_genes:,} genes with breed + 45kg effects
+  gsea_multistage_enrichment.xlsx          — GSEA preranked ({len(gsea_results)} libraries)
+  gsea_multistage_ssgsea_scores.xlsx       — Per-sample pathway scores
+  gsea_multistage_ssgsea_45kg_test.xlsx    — 45kg pathway comparison
+  fig_MS1_volcano_breed.pdf                — Volcano (breed main effect)
+  fig_MS2_gsea_enrichment_bar.pdf          — GSEA enrichment
+  fig_MS3_ssgsea_heatmap_45kg.pdf          — ssGSEA heatmap @ 45kg
+  fig_MS4_aa_pathway_scores.pdf            — AA pathway scores
+""")
+
+if gsea_results:
+    print("\nTop 25 GSEA hits (FDR < 0.25):")
+    all_sig = []
+    for lib, res in gsea_results.items():
+        if res is not None and len(res) > 0:
+            s = res[res['FDR q-val'] < 0.25].copy()
+            s['Library'] = lib
+            all_sig.append(s)
+    if all_sig:
+        top_all = pd.concat(all_sig, ignore_index=True)
+        top_all['abs_NES'] = top_all['NES'].abs()
+        for _, r in top_all.nlargest(25, 'abs_NES').iterrows():
+            sig = '***' if r['FDR q-val'] < 0.001 else ('**' if r['FDR q-val'] < 0.01 else ('*' if r['FDR q-val'] < 0.05 else ''))
+            print(f"  [{r['Library']:20s}] NES={float(r['NES']):+6.2f}  FDR={float(r['FDR q-val']):.4f} {sig}  {str(r['Term'])[:70]}")
+
+if len(pathway_df) > 0 and pathway_df['FDR_significant'].sum() > 0:
+    print(f"\nssGSEA FDR<0.05 pathways @ 45kg: {pathway_df['FDR_significant'].sum()}")
+    for _, r in pathway_df[pathway_df['FDR_significant']].head(20).iterrows():
+        print(f"  [{r['Library']:20s}] d={r['Cohens_d']:+7.3f}  P={r['P_value']:.4f}  Q={r['Q_value']:.4f}  {r['Pathway'][:70]}")

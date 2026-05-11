@@ -1,0 +1,16 @@
+Tier,Gene,Category,Pattern,Best_Muscle_Partner,Pearson_r,P_value,Rationale
+1,ACSL4,AA活化/膜重酰化：Lands cycle,DLY75偏高，TFB45不突出,TRIM63,0.7457,0.0337,PD-aligned + significant cross-tissue + strong proteolysis link
+1,CBR2,COX→前列腺素/血栓烷,TFB45与DLY75共同偏高,TRIM63,0.927,0.0009,PD-aligned + significant cross-tissue + strong proteolysis link
+1,CYP2E1,CYP450→EET/HETE,DLY75偏高，TFB45不突出,FBXO32,0.8522,0.0072,PD-aligned + significant cross-tissue + strong proteolysis link
+1,CYP2U1,CYP450→EET/HETE,DLY75偏高，TFB45不突出,TRIM63,0.7723,0.0247,PD-aligned + significant cross-tissue + strong proteolysis link
+1,CYP4V2,CYP450→EET/HETE,DLY75偏高，TFB45不突出,FBXO32,0.7723,0.0247,PD-aligned + significant cross-tissue + strong proteolysis link
+1,FADS1,上游合成：LA→AA,TFB45与DLY75共同偏高,TRIM63,0.7526,0.0312,PD-aligned + significant cross-tissue + strong proteolysis link
+1,FADS2,上游合成：LA→AA,DLY75偏高，TFB45不突出,TRIM63,0.7954,0.0183,PD-aligned + significant cross-tissue + strong proteolysis link
+1,FADS6,上游合成：LA→AA,TFB45与DLY75共同偏高,TRIM63,0.8431,0.0086,PD-aligned + significant cross-tissue + strong proteolysis link
+1,GPX3,LOX→白三烯/HETE,TFB45与DLY75共同偏高,TRIM63,0.8392,0.0092,PD-aligned + significant cross-tissue + strong proteolysis link
+1,PLA2G6,膜磷脂释放AA,DLY75偏高，TFB45不突出,TRIM63,0.8084,0.0152,PD-aligned + significant cross-tissue + strong proteolysis link
+1,PTGDS,COX→前列腺素/血栓烷,TFB45与DLY75共同偏高,TRIM63,0.7127,0.0472,PD-aligned + significant cross-tissue + strong proteolysis link
+2,CBR1,COX→前列腺素/血栓烷,DLY75偏高，TFB45不突出,FOXO3,0.8411,0.0089,PD-aligned + significant cross-tissue (not proteolysis-specific)
+2,HPGD,受体/转运/灭活,DLY75偏高，TFB45不突出,PPARA,0.767,0.0264,PD-aligned + significant cross-tissue (not proteolysis-specific)
+2,PLA2G7,膜磷脂释放AA,DLY75偏高，TFB45不突出,LTB4R,0.7516,0.0315,PD-aligned + significant cross-tissue (not proteolysis-specific)
+2,PNPLA8,膜磷脂释放AA,DLY75偏高，TFB45不突出,PPARA,0.7211,0.0435,PD-aligned + significant cross-tissue (not proteolysis-specific)
