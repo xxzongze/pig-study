@@ -1,0 +1,56 @@
+# =============================================================================
+# Conda environment for pig-study / ALDH18A1_project
+# 猪骨骼肌蛋白沉积与氮利用效率研究
+# =============================================================================
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate pig-study
+# =============================================================================
+
+name: pig-study
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ---- core Python ----
+  - python=3.11
+
+  # ---- scientific computing ----
+  - numpy
+  - pandas
+  - scipy
+  - openpyxl
+  - xlrd
+
+  # ---- statistics & machine learning ----
+  - scikit-learn
+  - statsmodels
+  - networkx
+
+  # ---- visualization ----
+  - matplotlib
+  - seaborn
+
+  # ---- bioinformatics ----
+  - gseapy          # GSEA enrichment analysis (Python)
+
+  # ---- jupyter ----
+  - jupyter
+  - nbconvert
+  - nbformat
+
+  # ---- pip-only packages (not in conda) ----
+  - pip
+  - pip:
+      - matplotlib-venn     # venn3, venn2 diagrams
+      - python-docx         # Word document generation
+
+# ---- R environment (install separately after conda env activation) ----
+# conda activate pig-study
+# conda install -c conda-forge r-base=4.3 r-essentials -y
+#
+# Then in R:
+#   install.packages(c("WGCNA", "dynamicTreeCut"))
+#   BiocManager::install(c("clusterProfiler", "enrichplot", "org.Hs.eg.db",
+#                          "DESeq2", "ReactomePA", "KEGGREST"))
